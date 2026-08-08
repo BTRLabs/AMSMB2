@@ -27,6 +27,13 @@ final class SMB2Client: CustomDebugStringConvertible, CustomReflectable, @unchec
     
     init() throws {
         self.context = try smb2_init_context().unwrap()
+        // Every async request hands libsmb2 a +1 that its callback consumes exactly once (see
+        // `generic_handler`). With passthrough ON, socket.c dispatches the interim
+        // `SMB2_STATUS_PENDING` reply through that same callback WITHOUT delisting the PDU, so the
+        // real reply dispatches a second time and over-releases the box. Pinned here rather than
+        // trusted to libsmb2's default, so the ownership contract holds by construction instead of
+        // by nobody having flipped it yet.
+        passthrough = false
     }
 
     deinit {
@@ -469,8 +476,8 @@ extension SMB2Client {
     // dies with its one dispatch — including the `SMB2_STATUS_SHUTDOWN` dispatch
     // `smb2_destroy_context` makes for every request still in its queues.
     //
-    // libsmb2's `passthrough` must stay off: with it set, an interim `SMB2_STATUS_PENDING` reply is
-    // dispatched through this same callback without delisting the PDU (socket.c), which would
+    // This is why `init` pins `passthrough` off: with it set, an interim `SMB2_STATUS_PENDING` reply
+    // is dispatched through this same callback without delisting the PDU (socket.c), which would
     // consume the +1 twice.
     static let generic_handler: smb2_command_cb = { _, status, command_data, cbdata in
         guard let cbdata else { return }
