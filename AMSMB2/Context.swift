@@ -252,9 +252,24 @@ extension SMB2Client {
         defer { _context_lock.unlock() }
         let result = smb2_service(context, revents)
         if result < 0 {
-            smb2_destroy_context(context)
+            // Read the error out while the context is still readable.
+            let description = errorString
+            // Clear the pointer BEFORE destroying, never after — `deinit` already gets this order
+            // right and this path did not.
+            //
+            // `smb2_destroy_context` dispatches `SMB2_STATUS_SHUTDOWN` to every PDU left in the out,
+            // pending and wait queues, freeing each as it goes. Those callbacks run arbitrary Swift:
+            // `generic_handler` releases the request box, and anything the box was keeping alive is
+            // released with it. If that lands on the last reference to this client, `deinit` runs
+            // part-way through the walk and destroys the very context being walked — a second pass
+            // over half-freed queues. `_context_lock` cannot stop it, because it is recursive and
+            // the re-entry is on the same thread.
+            //
+            // Nil first and that second pass becomes a no-op against `deinit`'s own nil guard.
+            let doomed = context
             context = nil
-            try POSIXError.throwIfError(result, description: errorString)
+            smb2_destroy_context(doomed)
+            try POSIXError.throwIfError(result, description: description)
         }
     }
 }
