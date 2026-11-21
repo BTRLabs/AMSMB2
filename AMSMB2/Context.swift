@@ -24,9 +24,27 @@ extension FileDescriptor {
 final class SMB2Client: CustomDebugStringConvertible, CustomReflectable, @unchecked Sendable {
     var context: UnsafeMutablePointer<smb2_context>?
     private var _context_lock = NSRecursiveLock()
-    
+
+    /// Guards libsmb2's process-wide context list (`active_contexts` in init.c).
+    ///
+    /// `smb2_init_context` links every context into that one list, `smb2_destroy_context` unlinks
+    /// it, and `smb2_context_active` walks it — none of them locked, and `_context_lock` is per
+    /// client so it cannot help. Clients created and released on different threads at once corrupt
+    /// the list: removals then fault on a dangling link (EXC_BAD_ACCESS at `SMB2_LIST_REMOVE` in
+    /// `smb2_destroy_context`) and walks can loop forever on a cycle. Every touch of the list goes
+    /// through this lock. Recursive because `smb2_destroy_context` dispatches request callbacks
+    /// that can release the last reference to another client on the same thread, whose `deinit`
+    /// destroys that context in turn.
+    static let contextListLock = NSRecursiveLock()
+
+    static func withContextList<R>(_ body: () throws -> R) rethrows -> R {
+        contextListLock.lock()
+        defer { contextListLock.unlock() }
+        return try body()
+    }
+
     init() throws {
-        self.context = try smb2_init_context().unwrap()
+        self.context = try SMB2Client.withContextList { smb2_init_context() }.unwrap()
         // Every async request hands libsmb2 a +1 that its callback consumes exactly once (see
         // `generic_handler`). With passthrough ON, socket.c dispatches the interim
         // `SMB2_STATUS_PENDING` reply through that same callback WITHOUT delisting the PDU, so the
@@ -43,7 +61,7 @@ final class SMB2Client: CustomDebugStringConvertible, CustomReflectable, @unchec
         }
         try? withThreadSafeContext { context in
             self.context = nil
-            smb2_destroy_context(context)
+            SMB2Client.withContextList { smb2_destroy_context(context) }
         }
     }
 
@@ -94,7 +112,8 @@ extension SMB2Client {
     }
     
     var isActive: Bool {
-        (try? smb2_context_active(context.unwrap())) == 1 && fileDescriptor.isValidSocket
+        (try? SMB2Client.withContextList { smb2_context_active(try context.unwrap()) }) == 1
+            && fileDescriptor.isValidSocket
     }
     
     var timeout: TimeInterval {
@@ -268,7 +287,7 @@ extension SMB2Client {
             // Nil first and that second pass becomes a no-op against `deinit`'s own nil guard.
             let doomed = context
             context = nil
-            smb2_destroy_context(doomed)
+            SMB2Client.withContextList { smb2_destroy_context(doomed) }
             try POSIXError.throwIfError(result, description: description)
         }
     }
